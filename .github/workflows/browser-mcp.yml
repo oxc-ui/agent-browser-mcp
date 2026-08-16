@@ -169,28 +169,15 @@ jobs:
           #   https://raw.githubusercontent.com/oxc-ui/agent-browser-mcp/endpoint/endpoint.json
           CONTENT_B64=$(base64 -w0 < endpoint.json)
 
+          EXISTING_FILE_SHA=""
           EXISTING=$(curl -s -o /tmp/existing.json -w '%{http_code}' \
             -H "Authorization: token ${GITHUB_TOKEN}" \
             "${API}/repos/${REPO}/contents/endpoint.json?ref=endpoint")
           echo "[publish] endpoint-branch probe HTTP ${EXISTING}"
 
           if [ "${EXISTING}" = "200" ]; then
-            SHA=$(python3 -c "import json; print(json.load(open('/tmp/existing.json'))['sha'])" 2>/dev/null)
-            echo "[publish] updating existing endpoint.json (sha=${SHA})"
-            HTTP=$(curl -s -o /tmp/put1.json -w '%{http_code}' -X PUT \
-              -H "Authorization: token ${GITHUB_TOKEN}" \
-              -H "Content-Type: application/json" \
-              "${API}/repos/${REPO}/contents/endpoint.json" \
-              -d "$(python3 -c "
-          import json
-          print(json.dumps({
-            'message': 'publish endpoint (run ${RUN_NUMBER}): ${TUNNEL_URL}',
-            'branch': 'endpoint',
-            'sha': '${SHA}',
-            'content': '${CONTENT_B64}',
-          }))")")
-            echo "[publish] PUT existing -> HTTP ${HTTP}"
-            [ "${HTTP}" != "200" ] && [ "${HTTP}" != "201" ] && cat /tmp/put1.json
+            EXISTING_FILE_SHA=$(python3 -c "import json; print(json.load(open('/tmp/existing.json'))['sha'])" 2>/dev/null || echo "")
+            echo "[publish] updating existing endpoint.json (sha=${EXISTING_FILE_SHA})"
           else
             echo "[publish] creating 'endpoint' branch"
             curl -s -o /tmp/main_sha.json \
@@ -218,21 +205,47 @@ jobs:
               "${API}/repos/${REPO}/git/refs" \
               -d "{\"ref\":\"refs/heads/endpoint\",\"sha\":\"${MAIN_SHA}\"}")
             echo "[publish] POST ref -> HTTP ${HTTP}"
-            # 422 = already exists (race with another runner) — fine, fall through
-
-            HTTP=$(curl -s -o /tmp/put2.json -w '%{http_code}' -X PUT \
+            # 422 = already exists (race with another runner or a prior run) — fine, fall through
+            # After branch exists, endpoint.json may or may not exist on it yet
+            PROBE2=$(curl -s -o /tmp/existing.json -w '%{http_code}' \
               -H "Authorization: token ${GITHUB_TOKEN}" \
-              -H "Content-Type: application/json" \
-              "${API}/repos/${REPO}/contents/endpoint.json" \
-              -d "$(python3 -c "
+              "${API}/repos/${REPO}/contents/endpoint.json?ref=endpoint")
+            echo "[publish] post-create endpoint.json probe HTTP ${PROBE2}"
+            if [ "${PROBE2}" = "200" ]; then
+              EXISTING_FILE_SHA=$(python3 -c "import json; print(json.load(open('/tmp/existing.json'))['sha'])" 2>/dev/null || echo "")
+              echo "[publish] existing endpoint.json sha=${EXISTING_FILE_SHA}"
+            fi
+          fi
+
+          # Build the PUT body — sha is REQUIRED if the file already exists
+          if [ -n "${EXISTING_FILE_SHA}" ]; then
+            PUT_DATA=$(python3 -c "
+          import json
+          print(json.dumps({
+            'message': 'publish endpoint (run ${RUN_NUMBER}): ${TUNNEL_URL}',
+            'branch': 'endpoint',
+            'sha': '${EXISTING_FILE_SHA}',
+            'content': '${CONTENT_B64}',
+          }))")
+          else
+            PUT_DATA=$(python3 -c "
           import json
           print(json.dumps({
             'message': 'publish endpoint (run ${RUN_NUMBER}): ${TUNNEL_URL}',
             'branch': 'endpoint',
             'content': '${CONTENT_B64}',
-          }))")")
-            echo "[publish] PUT endpoint.json -> HTTP ${HTTP}"
-            [ "${HTTP}" != "200" ] && [ "${HTTP}" != "201" ] && cat /tmp/put2.json
+          }))")
+          fi
+
+          HTTP=$(curl -s -o /tmp/put.json -w '%{http_code}' -X PUT \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${API}/repos/${REPO}/contents/endpoint.json" \
+            -d "${PUT_DATA}")
+          echo "[publish] PUT endpoint.json -> HTTP ${HTTP}"
+          if [ "${HTTP}" != "200" ] && [ "${HTTP}" != "201" ]; then
+            echo "[publish] PUT FAILED:"
+            cat /tmp/put.json
           fi
 
           echo "[publish] DONE — endpoint.json contents:"
