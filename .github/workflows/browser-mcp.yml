@@ -130,6 +130,9 @@ jobs:
           exit 1
 
       - name: Publish current endpoint to repo
+        # Never block the keep-alive supervisor on a publish hiccup — the
+        # tunnel itself stays up regardless.
+        continue-on-error: true
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
           MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
@@ -160,12 +163,15 @@ jobs:
           # Discovery URL: https://raw.githubusercontent.com/oxc-ui/agent-browser-mcp/endpoint/endpoint.json
           CONTENT_B64=$(base64 -w0 < endpoint.json)
 
-          # Check if 'endpoint' branch exists yet
-          if curl -sf -H "Authorization: token ${GITHUB_TOKEN}" \
-              "${API}/repos/${REPO}/contents/endpoint.json?ref=endpoint" > /dev/null; then
-            SHA=$(curl -sf -H "Authorization: token ${GITHUB_TOKEN}" \
-              "${API}/repos/${REPO}/contents/endpoint.json?ref=endpoint" \
-              | python3 -c "import sys,json; print(json.load(sys.stdin)['sha'])")
+          # Check if 'endpoint' branch exists yet. If the GET 404s, treat
+          # that as "branch doesn't exist" rather than aborting.
+          EXISTING=$(curl -s -o /tmp/existing.json -w '%{http_code}' \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${API}/repos/${REPO}/contents/endpoint.json?ref=endpoint" || echo "000")
+          echo "endpoint branch probe HTTP $EXISTING"
+
+          if [ "$EXISTING" = "200" ]; then
+            SHA=$(python3 -c "import json; print(json.load(open('/tmp/existing.json'))['sha'])")
             echo "endpoint branch exists, sha=$SHA"
             curl -sf -X PUT -H "Authorization: token ${GITHUB_TOKEN}" \
               -H "Content-Type: application/json" \
@@ -181,7 +187,26 @@ jobs:
           ")"
           else
             echo "endpoint branch missing — creating it"
-            # Create endpoint.json on the default branch first so we have a base for the branch
+            # Get current main HEAD SHA (fallback to repo default branch if main is missing)
+            curl -s -o /tmp/main_sha.json -w '' \
+              -H "Authorization: token ${GITHUB_TOKEN}" \
+              "${API}/repos/${REPO}/git/ref/heads/main"
+            MAIN_SHA=$(python3 -c "
+          import json
+          d = json.load(open('/tmp/main_sha.json'))
+          print(d.get('object',{}).get('sha',''))
+          ")
+            if [ -z "$MAIN_SHA" ]; then
+              echo "::warning::could not resolve main HEAD — publish skipped, next run will retry"
+              exit 0
+            fi
+            # Create the 'endpoint' branch pointing at main
+            curl -sf -X POST -H "Authorization: token ${GITHUB_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "${API}/repos/${REPO}/git/refs" \
+              -d "{\"ref\":\"refs/heads/endpoint\",\"sha\":\"${MAIN_SHA}\"}" \
+              || echo "(branch creation raced — fine)"
+            # Now write endpoint.json on it
             curl -sf -X PUT -H "Authorization: token ${GITHUB_TOKEN}" \
               -H "Content-Type: application/json" \
               "${API}/repos/${REPO}/contents/endpoint.json" \
@@ -189,17 +214,10 @@ jobs:
           import json
           print(json.dumps({
             'message': 'publish endpoint (run ${RUN_NUMBER}): ${TUNNEL_URL}',
+            'branch': 'endpoint',
             'content': '${CONTENT_B64}',
           }))
-          ")" || echo "(seed push to main raced or already up-to-date — fine)"
-            # Now create the orphan 'endpoint' branch pointing at it
-            MAIN_SHA=$(curl -sf -H "Authorization: token ${GITHUB_TOKEN}" \
-              "${API}/repos/${REPO}/git/ref/heads/main" \
-              | python3 -c "import sys,json; print(json.load(sys.stdin)['object']['sha'])")
-            curl -sf -X POST -H "Authorization: token ${GITHUB_TOKEN}" \
-              -H "Content-Type: application/json" \
-              "${API}/repos/${REPO}/git/refs" \
-              -d "{\"ref\":\"refs/heads/endpoint\",\"sha\":\"${MAIN_SHA}\"}"
+          ")"
           fi
 
           echo "published endpoint:"
