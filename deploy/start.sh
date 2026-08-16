@@ -10,6 +10,7 @@ mkdir -p "$LOG_DIR"
 PORT="${MCP_PORT:?MCP_PORT is required}"
 
 echo "[start] MCP port: $PORT"
+echo "[start] CF_TUNNEL_TOKEN bytes: ${#CF_TUNNEL_TOKEN} (first 40='${CF_TUNNEL_TOKEN:0:40}')"
 
 # browser-use env: headless, no sandbox (runner is a container), quiet telemetry
 export BROWSER_USE_HEADLESS=true
