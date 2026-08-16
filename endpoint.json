@@ -1,0 +1,8 @@
+{
+  "url": "https://placeholder.example.com",
+  "mcp_endpoint": "https://placeholder.example.com/mcp",
+  "auth_header": "Authorization: Bearer ${MCP_AUTH_TOKEN}",
+  "run_number": 0,
+  "updated_utc": "2026-08-16T15:50:00Z",
+  "note": "Placeholder — first workflow run will overwrite this with the real trycloudflare.com URL."
+}

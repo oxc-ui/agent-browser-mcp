@@ -18,6 +18,10 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
+        with:
+          # fetch full history so we can publish to the live README later
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: astral-sh/setup-uv@v6
         with:
@@ -54,25 +58,38 @@ jobs:
       - name: Render nginx config
         run: |
           mkdir -p /tmp/abmcp-logs
-          export MCP_AUTH_TOKEN="*** secrets.MCP_AUTH_TOKEN }}"
+          export MCP_AUTH_TOKEN="${{ secrets.MCP_AUTH_TOKEN }}"
           export MCP_PORT="${{ steps.port.outputs.port }}"
           envsubst '${MCP_AUTH_TOKEN} ${MCP_PORT}' \
             < deploy/nginx.conf.template > /tmp/nginx.conf
           sudo nginx -t -c /tmp/nginx.conf
 
-      - name: Start MCP server + nginx + tunnel
+      - name: Start MCP server + nginx + quick tunnel
         env:
-          CF_TUNNEL_TOKEN: "*** secrets.CF_TUNNEL_TOKEN }}"
-          MCP_AUTH_TOKEN: "*** secrets.MCP_AUTH_TOKEN }}"
-          OPENAI_API_KEY: "*** secrets.OPENAI_API_KEY }}"
-          OPENAI_API_BASE: "*** secrets.OPENAI_API_BASE }}"
+          MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
           MCP_PORT: ${{ steps.port.outputs.port }}
         run: bash deploy/start.sh
 
+      - name: Read published tunnel URL
+        id: tunnel
+        run: |
+          # start.sh wrote /tmp/abmcp-logs/tunnel_url.txt after the tunnel came up
+          if [ ! -f /tmp/abmcp-logs/tunnel_url.txt ]; then
+            echo "::error::tunnel_url.txt missing — cloudflared never registered a hostname"
+            tail -40 /tmp/abmcp-logs/cloudflared.log || true
+            exit 1
+          fi
+          URL=$(tr -d '[:space:]' < /tmp/abmcp-logs/tunnel_url.txt)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "current tunnel: $URL"
+
       - name: Health check (local + through tunnel)
         env:
-          MCP_AUTH_TOKEN: "*** secrets.MCP_AUTH_TOKEN }}"
+          MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
           MCP_PORT: ${{ steps.port.outputs.port }}
+          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
         run: |
           echo "--- local nginx /healthz ---"
           curl -sf --max-time 10 http://127.0.0.1/healthz && echo " OK"
@@ -86,11 +103,11 @@ jobs:
           echo "local mcp-proxy: HTTP $code"
           head -c 300 /tmp/local_init.txt; echo
 
-          echo "--- through Cloudflare tunnel ---"
+          echo "--- through Cloudflare quick-tunnel: $TUNNEL_URL ---"
           for i in $(seq 1 10); do
             code=$(curl -s -o /tmp/tunnel_init.txt -w '%{http_code}' --max-time 30 \
-              -X POST https://agent-browser.oxu.indevs.in/mcp \
-              -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+              -X POST "$TUNNEL_URL/mcp" \
+              -H "Authorization: Bearer ${MCP_AUTH_TOKEN}" \
               -H 'Content-Type: application/json' \
               -H 'Accept: application/json, text/event-stream' \
               -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}}}')
@@ -106,11 +123,99 @@ jobs:
           tail -c 500 /tmp/tunnel_init.txt
           exit 1
 
+      - name: Publish current endpoint to repo
+        env:
+          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
+          MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          set -e
+          NOW_UTC=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+
+          cat > endpoint.json <<EOF
+          {
+            "url": "${TUNNEL_URL}",
+            "mcp_endpoint": "${TUNNEL_URL}/mcp",
+            "auth_header": "Authorization: Bearer \${MCP_AUTH_TOKEN}",
+            "run_number": ${RUN_NUMBER},
+            "updated_utc": "${NOW_UTC}",
+            "note": "This URL changes every ~5h on quick-tunnel rotation. The live endpoint is also in this repo's README."
+          }
+          EOF
+
+          # generate README with the current endpoint baked in
+          cat > README.md <<'README_HEADER'
+          # agent-browser-mcp
+
+          A browser-use MCP server running on GitHub Actions, exposed via a
+          rotating Cloudflare **quick-tunnel** (random `*.trycloudflare.com`
+          hostname — no account, no token required).
+
+          **The URL changes every ~5 hours** when the worker handoff fires.
+          Always fetch the current endpoint from `endpoint.json` at the raw URL:
+
+          - JSON:   https://raw.githubusercontent.com/oxc-ui/agent-browser-mcp/main/endpoint.json
+          - README: https://github.com/oxc-ui/agent-browser-mcp#current-endpoint
+
+          ## Current endpoint
+
+          README_HEADER
+
+          cat >> README.md <<README_BODY
+          - **MCP URL:**       `${TUNNEL_URL}/mcp`
+          - **Auth header:**   `Authorization: Bearer \${MCP_AUTH_TOKEN}`
+          - **Last updated:**  ${NOW_UTC} (run #${RUN_NUMBER})
+
+          ## How it works
+
+          - `mcp-proxy` bridges browser-use's stdio MCP server to StreamableHTTP
+          - nginx on `:80` adds bearer-token auth (`${MCP_AUTH_TOKEN}`) and a public `/healthz`
+          - `cloudflared --url http://localhost` opens a quick-tunnel to a random
+            `*.trycloudflare.com` hostname — no Cloudflare account needed
+          - The current URL is published back to this repo on every successful start
+          - A supervisor loop restarts any of the three processes if they die
+          - A 5h cron + 5h50m timeout creates overlap so the endpoint is always live
+
+          ## MCP client config (Claude Desktop, Cursor, etc.)
+
+          \`\`\`json
+          {
+            "mcpServers": {
+              "agent-browser": {
+                "url": "${TUNNEL_URL}/mcp",
+                "transport": "http",
+                "headers": {
+                  "Authorization": "Bearer \${MCP_AUTH_TOKEN}"
+                }
+              }
+            }
+          }
+          \`\`\`
+
+          ## Repo layout
+
+          - `.github/workflows/browser-mcp.yml` — the workflow
+          - `deploy/start.sh` — launches mcp-proxy + nginx + cloudflared
+          - `deploy/nginx.conf.template` — bearer-auth + `/healthz`
+          - `endpoint.json` — current live endpoint (auto-updated)
+          README_BODY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add endpoint.json README.md
+          if git diff --cached --quiet; then
+            echo "no changes to publish"
+          else
+            git commit -m "publish endpoint (run #${RUN_NUMBER}): ${TUNNEL_URL}"
+            # push quietly; if it races with another runner, just skip
+            git push origin HEAD:main 2>&1 | tail -3 || echo "push raced with another runner — skipped"
+          fi
+
       - name: Keep alive (supervisor, ~5h45m)
         env:
-          MCP_AUTH_TOKEN: "*** secrets.MCP_AUTH_TOKEN }}"
+          MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
           MCP_PORT: ${{ steps.port.outputs.port }}
-          CF_TUNNEL_TOKEN: "*** secrets.CF_TUNNEL_TOKEN }}"
+          TUNNEL_URL_FILE: /tmp/abmcp-logs/tunnel_url.txt
         run: |
           # 345 one-minute ticks; every tick verify the three processes,
           # restart any that died; every 5th tick probe through the tunnel
@@ -129,8 +234,8 @@ jobs:
                     ;;
                   nginx) sudo nginx -c /tmp/nginx.conf ;;
                   cloudflared)
-                    nohup cloudflared tunnel --no-autoupdate run \
-                      --token "$CF_TUNNEL_TOKEN" \
+                    # quick-tunnel mode: no token, hostname goes to stdout
+                    nohup cloudflared tunnel --no-autoupdate --url http://localhost \
                       >> /tmp/abmcp-logs/cloudflared.log 2>&1 &
                     ;;
                 esac

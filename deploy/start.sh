@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Start the browser-use MCP stack on a GitHub Actions runner:
-#   mcp-proxy (stdio->streamable HTTP) -> nginx (auth, :80) -> cloudflared tunnel
+#   mcp-proxy (stdio->streamable HTTP) -> nginx (auth, :80) -> cloudflared quick-tunnel
+#
+# No Cloudflare account/token needed: --url mode hands out a random *.trycloudflare.com
+# hostname. The current URL is written to /tmp/abmcp-logs/tunnel_url.txt so the
+# workflow can read it, and to GitHub via a separate commit step.
 set -uo pipefail
 
 export PATH="$HOME/.local/bin:$PATH"
@@ -8,9 +12,9 @@ LOG_DIR=/tmp/abmcp-logs
 mkdir -p "$LOG_DIR"
 
 PORT="${MCP_PORT:?MCP_PORT is required}"
+AUTH="${MCP_AUTH_TOKEN:-}"
 
 echo "[start] MCP port: $PORT"
-echo "[start] CF_TUNNEL_TOKEN bytes: ${#CF_TUNNEL_TOKEN} (first 40='${CF_TUNNEL_TOKEN:0:40}')"
 
 # browser-use env: headless, no sandbox (runner is a container), quiet telemetry
 export BROWSER_USE_HEADLESS=true
@@ -49,10 +53,37 @@ echo "[start] launching nginx on :80..."
 sudo nginx -c /tmp/nginx.conf
 echo "[start] nginx up"
 
-echo "[start] launching cloudflared tunnel..."
-nohup cloudflared tunnel --no-autoupdate run --token "$CF_TUNNEL_TOKEN" \
+echo "[start] launching cloudflared quick-tunnel (no token)..."
+# cloudflared --url writes the assigned *.trycloudflare.com URL to stdout.
+# We tee stdout to a log AND a fifo-free extraction: tail -F the log in parallel
+# and grep for the URL. Simpler approach: launch cloudflared into a known log
+# file, then poll the log until we see the "Your quick Tunnel has been created!"
+# line and parse the URL right after it.
+: > "$LOG_DIR/cloudflared.log"
+nohup cloudflared tunnel --no-autoupdate --url http://localhost \
   >> "$LOG_DIR/cloudflared.log" 2>&1 &
-echo "[start] cloudflared pid: $!"
+CFD_PID=$!
+echo "[start] cloudflared pid: $CFD_PID"
 
-sleep 5
+# wait up to 60s for the URL to appear
+URL=""
+for i in $(seq 1 60); do
+  # cloudflared prints a banner like:
+  #   INF |  Your quick Tunnel has been created! Visit it at (it may take some time to be reachable):
+  #   INF |  https://xxxx-yyyy.trycloudflare.com                                     |
+  URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG_DIR/cloudflared.log" | head -1 || true)
+  if [ -n "$URL" ]; then
+    echo "$URL" > "$LOG_DIR/tunnel_url.txt"
+    echo "[start] tunnel URL captured after ${i}s: $URL"
+    break
+  fi
+  sleep 1
+done
+
+if [ -z "$URL" ]; then
+  echo "[start] WARNING: cloudflared URL not seen after 60s"
+  tail -20 "$LOG_DIR/cloudflared.log" || true
+fi
+
+sleep 3
 echo "[start] all services launched"
