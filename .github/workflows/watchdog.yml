@@ -1,0 +1,62 @@
+name: watchdog
+
+on:
+  schedule:
+    # every 15 min — probe the public endpoint; if it's dead AND no
+    # browser-mcp run is in flight, re-dispatch the main workflow
+    - cron: '*/15 * * * *'
+  workflow_dispatch: {}
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe MCP endpoint through tunnel
+        id: probe
+        run: |
+          code=$(curl -s -o /tmp/probe.txt -w '%{http_code}' --max-time 30 \
+            -X POST https://agent-browser.oxu.indevs.in/mcp \
+            -H "Authorization: Bearer ${{ secrets.MCP_AUTH_TOKEN }}" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"watchdog","version":"1.0"}}}' || echo "000")
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "probe result: HTTP $code"
+          head -c 200 /tmp/probe.txt 2>/dev/null; echo
+
+      - name: Re-dispatch browser-mcp if endpoint is dead
+        env:
+          GH_TOKEN: "*** secrets.GITHUB_TOKEN }}"
+        run: |
+          code="${{ steps.probe.outputs.code }}"
+          # 200 = healthy, 401 = nginx alive (auth drift) — both mean "up"
+          if [ "$code" = "200" ] || [ "$code" = "401" ]; then
+            echo "endpoint alive (HTTP $code) — nothing to do"
+            exit 0
+          fi
+
+          echo "endpoint dead (HTTP $code) — checking for in-flight runs..."
+          active=$(curl -s \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/browser-mcp.yml/runs?per_page=20" \
+            | python3 -c "
+          import json, sys
+          d = json.load(sys.stdin)
+          n = sum(1 for r in d.get('workflow_runs', [])
+                  if r['status'] in ('queued', 'in_progress'))
+          print(n)")
+          echo "active browser-mcp runs: $active"
+
+          if [ "$active" != "0" ]; then
+            echo "a run is already booting — skipping dispatch"
+            exit 0
+          fi
+
+          echo "dispatching fresh browser-mcp run..."
+          curl -sf -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/browser-mcp.yml/dispatches" \
+            -d '{"ref":"main"}'
+          echo "dispatched"

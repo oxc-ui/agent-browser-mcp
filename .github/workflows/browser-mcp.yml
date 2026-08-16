@@ -1,0 +1,151 @@
+name: browser-mcp
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    # every 5 hours — each run lives ~5h50m so the next run overlaps
+    # the previous one by ~50 min (seamless handoff, no downtime)
+    - cron: '0 */5 * * *'
+
+# NOTE: no concurrency group on purpose — overlapping runs are the
+# handoff mechanism. Port rotation (below) prevents collisions.
+
+jobs:
+  serve:
+    runs-on: ubuntu-latest
+    # 5h50m — just under the 6h free-tier cap, 50m longer than the 5h
+    # schedule interval so there is always overlap
+    timeout-minutes: 350
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Install browser-use MCP + mcp-proxy
+        run: |
+          uv tool install mcp-proxy
+          uv tool install 'browser-use[cli]'
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          # warm the uv cache so the stdio server starts fast later
+          uvx --from 'browser-use[cli]' browser-use --version || true
+
+      - name: Install cloudflared
+        run: |
+          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+            -o /usr/local/bin/cloudflared
+          chmod +x /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Chrome /dev/shm fix
+        run: sudo mount -t tmpfs -o size=2g tmpfs /dev/shm
+
+      - name: Compute rotated port
+        id: port
+        run: |
+          # run 1->8002, 2->8003, 3->8004, 4->8001, 5->8002 ...
+          # consecutive runs ALWAYS land on different ports, cycle of 4
+          PORT=$(( 8001 + ( ${{ github.run_number }} % 4 ) ))
+          echo "port=$PORT" >> "$GITHUB_OUTPUT"
+          echo "run_number=${{ github.run_number }} -> port $PORT"
+
+      - name: Render nginx config
+        run: |
+          mkdir -p /tmp/abmcp-logs
+          export MCP_AUTH_TOKEN="*** secrets.MCP_AUTH_TOKEN }}"
+          export MCP_PORT="${{ steps.port.outputs.port }}"
+          envsubst '${MCP_AUTH_TOKEN} ${MCP_PORT}' \
+            < deploy/nginx.conf.template > /tmp/nginx.conf
+          nginx -t -c /tmp/nginx.conf
+
+      - name: Start MCP server + nginx + tunnel
+        env:
+          CF_TUNNEL_TOKEN: "*** secrets.CF_TUNNEL_TOKEN }}"
+          MCP_AUTH_TOKEN: "*** secrets.MCP_AUTH_TOKEN }}"
+          OPENAI_API_KEY: "*** secrets.OPENAI_API_KEY }}"
+          OPENAI_API_BASE: "*** secrets.OPENAI_API_BASE }}"
+          MCP_PORT: ${{ steps.port.outputs.port }}
+        run: bash deploy/start.sh
+
+      - name: Health check (local + through tunnel)
+        env:
+          MCP_AUTH_TOKEN: "*** secrets.MCP_AUTH_TOKEN }}"
+        run: |
+          echo "--- local nginx /healthz ---"
+          curl -sf --max-time 10 http://127.0.0.1/healthz && echo " OK"
+
+          echo "--- local MCP initialize ---"
+          code=$(curl -s -o /tmp/local_init.txt -w '%{http_code}' --max-time 60 \
+            -X POST "http://127.0.0.1:${MCP_PORT:-8001}/mcp" \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}}}')
+          echo "local mcp-proxy: HTTP $code"
+          head -c 300 /tmp/local_init.txt; echo
+
+          echo "--- through Cloudflare tunnel ---"
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /tmp/tunnel_init.txt -w '%{http_code}' --max-time 30 \
+              -X POST https://agent-browser.oxu.indevs.in/mcp \
+              -H "Authorization: Bearer $MCP_AUTH_TOKEN" \
+              -H 'Content-Type: application/json' \
+              -H 'Accept: application/json, text/event-stream' \
+              -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}}}')
+            echo "attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then
+              head -c 300 /tmp/tunnel_init.txt; echo
+              echo "TUNNEL HEALTHY"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::Tunnel health check failed (last HTTP $code)"
+          tail -c 500 /tmp/tunnel_init.txt
+          exit 1
+
+      - name: Keep alive (supervisor, ~5h45m)
+        env:
+          MCP_AUTH_TOKEN: "*** secrets.MCP_AUTH_TOKEN }}"
+          MCP_PORT: ${{ steps.port.outputs.port }}
+        run: |
+          # 345 one-minute ticks; every tick verify the three processes,
+          # restart any that died; every 5th tick probe through the tunnel
+          for i in $(seq 1 345); do
+            sleep 60
+
+            for svc in mcp-proxy nginx cloudflared; do
+              if ! pgrep -f "$svc" > /dev/null; then
+                echo "[tick $i] $svc died — restarting"
+                case $svc in
+                  mcp-proxy)
+                    nohup "$HOME/.local/bin/mcp-proxy" --host 127.0.0.1 \
+                      --port "$MCP_PORT" --stateless -- \
+                      uvx --from 'browser-use[cli]' browser-use --mcp \
+                      >> /tmp/abmcp-logs/mcp-proxy.log 2>&1 &
+                    ;;
+                  nginx) nginx -c /tmp/nginx.conf ;;
+                  cloudflared)
+                    nohup cloudflared tunnel --no-autoupdate run \
+                      --token "$CF_TUNNEL_TOKEN" \
+                      >> /tmp/abmcp-logs/cloudflared.log 2>&1 &
+                    ;;
+                esac
+              fi
+            done
+
+            if [ $(( i % 5 )) -eq 0 ]; then
+              code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
+                http://127.0.0.1/healthz)
+              echo "[tick $i] local healthz: $code"
+            fi
+          done
+          echo "shift complete — next runner should already be serving"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-mcp-logs-run-${{ github.run_number }}
+          path: /tmp/abmcp-logs/
+          if-no-files-found: ignore
