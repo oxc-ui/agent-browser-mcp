@@ -92,6 +92,10 @@ jobs:
           echo "current tunnel: $URL"
 
       - name: Health check (local + through tunnel)
+        # Tunnel may need a few seconds to fully propagate even after
+        # cloudflared prints the URL — don't fail the run if it isn't
+        # reachable yet; the keep-alive loop will keep retrying.
+        continue-on-error: true
         env:
           MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
           MCP_PORT: ${{ steps.port.outputs.port }}
@@ -110,7 +114,7 @@ jobs:
           head -c 300 /tmp/local_init.txt; echo
 
           echo "--- through Cloudflare quick-tunnel: $TUNNEL_URL ---"
-          for i in $(seq 1 10); do
+          for i in $(seq 1 15); do
             code=$(curl -s -o /tmp/tunnel_init.txt -w '%{http_code}' --max-time 30 \
               -X POST "$TUNNEL_URL/mcp" \
               -H "Authorization: Bearer ${MCP_AUTH_TOKEN}" \
@@ -123,11 +127,11 @@ jobs:
               echo "TUNNEL HEALTHY"
               exit 0
             fi
-            sleep 10
+            sleep 15
           done
-          echo "::error::Tunnel health check failed (last HTTP $code)"
+          echo "::warning::Tunnel probe did not return 200 within 225s — keep-alive will keep retrying"
           tail -c 500 /tmp/tunnel_init.txt
-          exit 1
+          # do NOT exit 1 — keep-alive must run regardless
 
       - name: Publish current endpoint to repo
         # Never block the keep-alive supervisor on a publish hiccup — the
