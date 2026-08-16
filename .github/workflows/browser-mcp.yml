@@ -72,6 +72,7 @@ jobs:
       - name: Health check (local + through tunnel)
         env:
           MCP_AUTH_TOKEN: "*** secrets.MCP_AUTH_TOKEN }}"
+          MCP_PORT: ${{ steps.port.outputs.port }}
         run: |
           echo "--- local nginx /healthz ---"
           curl -sf --max-time 10 http://127.0.0.1/healthz && echo " OK"
@@ -109,6 +110,7 @@ jobs:
         env:
           MCP_AUTH_TOKEN: "*** secrets.MCP_AUTH_TOKEN }}"
           MCP_PORT: ${{ steps.port.outputs.port }}
+          CF_TUNNEL_TOKEN: "*** secrets.CF_TUNNEL_TOKEN }}"
         run: |
           # 345 one-minute ticks; every tick verify the three processes,
           # restart any that died; every 5th tick probe through the tunnel
