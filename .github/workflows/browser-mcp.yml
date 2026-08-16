@@ -25,7 +25,8 @@ jobs:
 
       - name: Install browser-use MCP + mcp-proxy
         run: |
-          uv tool install mcp-proxy
+          # mcp-proxy 0.12.x breaks against mcp>=2.0 (request_ctx removed) — pin mcp<2
+          uv tool install 'mcp-proxy' --with 'mcp<2'
           uv tool install 'browser-use[cli]'
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           # warm the uv cache so the stdio server starts fast later
