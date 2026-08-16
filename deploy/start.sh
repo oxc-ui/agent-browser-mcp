@@ -45,7 +45,7 @@ for i in $(seq 1 60); do
 done
 
 echo "[start] launching nginx on :80..."
-nginx -c /tmp/nginx.conf
+sudo nginx -c /tmp/nginx.conf
 echo "[start] nginx up"
 
 echo "[start] launching cloudflared tunnel..."

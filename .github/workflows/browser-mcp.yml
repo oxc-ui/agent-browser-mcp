@@ -57,7 +57,7 @@ jobs:
           export MCP_PORT="${{ steps.port.outputs.port }}"
           envsubst '${MCP_AUTH_TOKEN} ${MCP_PORT}' \
             < deploy/nginx.conf.template > /tmp/nginx.conf
-          nginx -t -c /tmp/nginx.conf
+          sudo nginx -t -c /tmp/nginx.conf
 
       - name: Start MCP server + nginx + tunnel
         env:
@@ -124,7 +124,7 @@ jobs:
                       uvx --from 'browser-use[cli]' browser-use --mcp \
                       >> /tmp/abmcp-logs/mcp-proxy.log 2>&1 &
                     ;;
-                  nginx) nginx -c /tmp/nginx.conf ;;
+                  nginx) sudo nginx -c /tmp/nginx.conf ;;
                   cloudflared)
                     nohup cloudflared tunnel --no-autoupdate run \
                       --token "$CF_TUNNEL_TOKEN" \
