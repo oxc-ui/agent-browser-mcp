@@ -134,8 +134,12 @@ jobs:
           # do NOT exit 1 — keep-alive must run regardless
 
       - name: Publish current endpoint to repo
-        # Never block the keep-alive supervisor on a publish hiccup — the
-        # tunnel itself stays up regardless.
+        # Best-effort publish of the live tunnel URL to a 'endpoint' branch
+        # via Contents API. Skipped silently if the workflow's GITHUB_TOKEN
+        # lacks repo write (some repos default to read-only). The tunnel
+        # itself stays up regardless; clients can discover the URL via
+        # `gh run view <id> --log | grep "current tunnel:"` for the latest
+        # run.
         continue-on-error: true
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
@@ -144,13 +148,17 @@ jobs:
           API: ${{ github.api_url }}
           REPO: ${{ github.repository }}
         run: |
-          # disable -e so we can log every step's outcome before exiting
           set +e
-
           NOW_UTC=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          echo "[publish] TUNNEL_URL=${TUNNEL_URL}"
-          echo "[publish] RUN_NUMBER=${RUN_NUMBER}"
-          echo "[publish] repo=${REPO}"
+
+          # Always log the current tunnel URL prominently so it's easy to
+          # find in `gh run view --log`.
+          echo "############################################################"
+          echo "# CURRENT TUNNEL ENDPOINT (run ${RUN_NUMBER}, ${NOW_UTC})"
+          echo "# MCP URL:     ${TUNNEL_URL}/mcp"
+          echo "# Health URL:  ${TUNNEL_URL}/healthz"
+          echo "# Auth header: Authorization: Bearer \${MCP_AUTH_TOKEN}"
+          echo "############################################################"
 
           cat > endpoint.json <<EOF
           {
@@ -159,65 +167,69 @@ jobs:
             "auth_header": "Authorization: Bearer \${MCP_AUTH_TOKEN}",
             "run_number": ${RUN_NUMBER},
             "updated_utc": "${NOW_UTC}",
-            "note": "This URL changes every ~5h on quick-tunnel rotation."
+            "note": "Auto-published by browser-mcp workflow run #${RUN_NUMBER}."
           }
           EOF
-
-          # Mirror endpoint.json to a workflow-owned 'endpoint' orphan branch
-          # via the Contents API — avoids races with the workflow's own
-          # main-branch checkout. Discovery URL:
-          #   https://raw.githubusercontent.com/oxc-ui/agent-browser-mcp/endpoint/endpoint.json
           CONTENT_B64=$(base64 -w0 < endpoint.json)
 
+          # Probe whether GITHUB_TOKEN can write to this repo. If not,
+          # print a clear warning and skip silently — keep-alive still runs.
+          PROBE=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            "${API}/repos/${REPO}")
+          echo "[publish] repo auth probe: HTTP ${PROBE}"
+          if [ "${PROBE}" != "200" ]; then
+            echo "[publish] ::warning::GITHUB_TOKEN cannot access repo (HTTP ${PROBE}) — skipping publish, keep-alive still runs"
+            cat endpoint.json
+            exit 0
+          fi
+
+          # Look up the file's sha on the endpoint branch (if it exists)
           EXISTING_FILE_SHA=""
-          EXISTING=$(curl -s -o /tmp/existing.json -w '%{http_code}' \
+          FILE_HTTP=$(curl -s -o /tmp/existing.json -w '%{http_code}' \
             -H "Authorization: token ${GITHUB_TOKEN}" \
             "${API}/repos/${REPO}/contents/endpoint.json?ref=endpoint")
-          echo "[publish] endpoint-branch probe HTTP ${EXISTING}"
-
-          if [ "${EXISTING}" = "200" ]; then
-            EXISTING_FILE_SHA=$(python3 -c "import json; print(json.load(open('/tmp/existing.json'))['sha'])" 2>/dev/null || echo "")
-            echo "[publish] updating existing endpoint.json (sha=${EXISTING_FILE_SHA})"
-          else
-            echo "[publish] creating 'endpoint' branch"
-            curl -s -o /tmp/main_sha.json \
-              -H "Authorization: token ${GITHUB_TOKEN}" \
-              "${API}/repos/${REPO}/git/ref/heads/main"
-            MAIN_SHA=$(python3 -c "
+          echo "[publish] endpoint.json on endpoint branch: HTTP ${FILE_HTTP}"
+          if [ "${FILE_HTTP}" = "200" ]; then
+            EXISTING_FILE_SHA=$(python3 -c "
           import json
           try:
-              d = json.load(open('/tmp/main_sha.json'))
-              print(d.get('object',{}).get('sha',''))
+              print(json.load(open('/tmp/existing.json'))['sha'])
           except Exception as e:
               print('')
           " 2>/dev/null)
-            echo "[publish] main HEAD sha=${MAIN_SHA}"
+            echo "[publish] existing sha: ${EXISTING_FILE_SHA}"
+          fi
 
-            if [ -z "${MAIN_SHA}" ]; then
-              echo "[publish] ::warning::could not resolve main HEAD — skipping publish"
-              cat endpoint.json
-              exit 0
-            fi
-
-            HTTP=$(curl -s -o /tmp/ref.json -w '%{http_code}' -X POST \
+          # If file doesn't exist on endpoint branch, ensure branch exists first
+          if [ -z "${EXISTING_FILE_SHA}" ]; then
+            BRANCH_HTTP=$(curl -s -o /dev/null -w '%{http_code}' \
               -H "Authorization: token ${GITHUB_TOKEN}" \
-              -H "Content-Type: application/json" \
-              "${API}/repos/${REPO}/git/refs" \
-              -d "{\"ref\":\"refs/heads/endpoint\",\"sha\":\"${MAIN_SHA}\"}")
-            echo "[publish] POST ref -> HTTP ${HTTP}"
-            # 422 = already exists (race with another runner or a prior run) — fine, fall through
-            # After branch exists, endpoint.json may or may not exist on it yet
-            PROBE2=$(curl -s -o /tmp/existing.json -w '%{http_code}' \
-              -H "Authorization: token ${GITHUB_TOKEN}" \
-              "${API}/repos/${REPO}/contents/endpoint.json?ref=endpoint")
-            echo "[publish] post-create endpoint.json probe HTTP ${PROBE2}"
-            if [ "${PROBE2}" = "200" ]; then
-              EXISTING_FILE_SHA=$(python3 -c "import json; print(json.load(open('/tmp/existing.json'))['sha'])" 2>/dev/null || echo "")
-              echo "[publish] existing endpoint.json sha=${EXISTING_FILE_SHA}"
+              "${API}/repos/${REPO}/branches/endpoint")
+            echo "[publish] endpoint branch exists?: HTTP ${BRANCH_HTTP}"
+            if [ "${BRANCH_HTTP}" != "200" ]; then
+              echo "[publish] creating endpoint branch"
+              curl -s -o /tmp/main_sha.json \
+                -H "Authorization: token ${GITHUB_TOKEN}" \
+                "${API}/repos/${REPO}/git/ref/heads/main"
+              MAIN_SHA=$(python3 -c "
+          import json
+          try:
+              print(json.load(open('/tmp/main_sha.json'))['object']['sha'])
+          except Exception as e:
+              print('')
+          " 2>/dev/null)
+              if [ -n "${MAIN_SHA}" ]; then
+                curl -s -o /tmp/ref.json -w '%{http_code}\n' -X POST \
+                  -H "Authorization: token ${GITHUB_TOKEN}" \
+                  -H "Content-Type: application/json" \
+                  "${API}/repos/${REPO}/git/refs" \
+                  -d "{\"ref\":\"refs/heads/endpoint\",\"sha\":\"${MAIN_SHA}\"}"
+              fi
             fi
           fi
 
-          # Build the PUT body — sha is REQUIRED if the file already exists
+          # Build PUT body
           if [ -n "${EXISTING_FILE_SHA}" ]; then
             PUT_DATA=$(python3 -c "
           import json
@@ -237,14 +249,14 @@ jobs:
           }))")
           fi
 
-          HTTP=$(curl -s -o /tmp/put.json -w '%{http_code}' -X PUT \
+          PUT_HTTP=$(curl -s -o /tmp/put.json -w '%{http_code}' -X PUT \
             -H "Authorization: token ${GITHUB_TOKEN}" \
             -H "Content-Type: application/json" \
             "${API}/repos/${REPO}/contents/endpoint.json" \
             -d "${PUT_DATA}")
-          echo "[publish] PUT endpoint.json -> HTTP ${HTTP}"
-          if [ "${HTTP}" != "200" ] && [ "${HTTP}" != "201" ]; then
-            echo "[publish] PUT FAILED:"
+          echo "[publish] PUT endpoint.json -> HTTP ${PUT_HTTP}"
+          if [ "${PUT_HTTP}" != "200" ] && [ "${PUT_HTTP}" != "201" ]; then
+            echo "[publish] PUT FAILED body:"
             cat /tmp/put.json
           fi
 
