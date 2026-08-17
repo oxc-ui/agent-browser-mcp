@@ -22,23 +22,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Compute rotated host port
-        id: port
-        run: |
-          # run 1->8002, 2->8003, 3->8004, 4->8001, 5->8002 ...
-          # consecutive runs ALWAYS land on different host-mapped ports,
-          # so overlapping runners don't collide.
-          PORT=$(( 8001 + ( ${{ github.run_number }} % 4 ) ))
-          echo "port=$PORT" >> "$GITHUB_OUTPUT"
-          echo "run_number=${{ github.run_number }} -> host port $PORT"
-
       - name: Bring up the Docker stack
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
-          MCP_PORT: ${{ steps.port.outputs.port }}
         run: |
           # Don't use set -e here — we want diagnostic output even on failure
           set +e
@@ -51,7 +40,6 @@ jobs:
           MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
           OPENAI_API_KEY=${OPENAI_API_KEY}
           OPENAI_API_BASE=${OPENAI_API_BASE}
-          MCP_PORT=${MCP_PORT}
           EOF
 
           # Build + start
@@ -89,7 +77,7 @@ jobs:
             exit 1
           fi
 
-          echo "MCP_HOST_PORT=${MCP_PORT}" >> "$GITHUB_ENV"
+          echo "MCP_HOST_PORT=8080" >> "$GITHUB_ENV"
 
       - name: Health check (local + through tunnel)
         env:

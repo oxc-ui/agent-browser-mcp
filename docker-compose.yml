@@ -18,8 +18,13 @@ services:
       dockerfile: Dockerfile.mcp
     container_name: agent-browser-mcp
     restart: unless-stopped
+    # Publish on a fixed host port 8080. The tunnel container runs on
+    # host network and dials localhost:8080 (per the Cloudflare ingress
+    # rule). The previous rotating host port (8001-8004) is no longer
+    # needed since concurrent runs are mutually exclusive: a new run
+    # starts only after the previous run's keep-alive exits cleanly.
     ports:
-      - "${MCP_PORT:-8080}:8080"
+      - "8080:8080"
     environment:
       BROWSER_USE_HEADLESS: "true"
       ANONYMIZED_TELEMETRY: "false"
@@ -38,18 +43,18 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: agent-browser-tunnel
     restart: unless-stopped
+    # Host network: cloudflared's "localhost:8080" (configured in Cloudflare
+    # ingress) is then the host's localhost:8080, which is the port the
+    # mcp container publishes to. Without this, cloudflared inside the
+    # container would dial its own loopback (empty).
+    network_mode: host
     depends_on:
       mcp:
         condition: service_healthy
     command:
       - tunnel
       - --no-autoupdate
-      - --metrics
-      - 127.0.0.1:2000
-      - --url
-      - http://mcp:8080
       - run
     environment:
       TUNNEL_TRANSPORT_LOGLEVEL: info
-      TUNNEL_METRICS: 127.0.0.1:2000
       TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN:?CF_TUNNEL_TOKEN must be set}
