@@ -78,16 +78,22 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def wait_for_mcp_proxy():
-    """Block until mcp-proxy is answering on its private port."""
+    """Block until mcp-proxy is answering on its private port.
+
+    mcp-proxy doesn't expose /healthz — we just check that the TCP
+    port accepts a connection. (browser-use is what mcp-proxy talks
+    to over stdio; if it died, mcp-proxy would die with it.)
+    """
+    import socket
     deadline = time.time() + 90
     while time.time() < deadline:
         try:
-            urllib.request.urlopen(
-                f"http://127.0.0.1:{MCP_PROXY_PORT}/healthz",
-                timeout=2,
-            )
-            return
-        except Exception:
+            with socket.create_connection(("127.0.0.1", MCP_PROXY_PORT), timeout=2):
+                # Connected — mcp-proxy is listening. Give it one
+                # more second to fully initialize before returning.
+                time.sleep(1)
+                return
+        except (OSError, ConnectionRefusedError):
             time.sleep(1)
     print("[supervise] WARNING: mcp-proxy never came up after 90s", file=sys.stderr)
 
