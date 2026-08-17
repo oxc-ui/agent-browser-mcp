@@ -49,8 +49,7 @@ services:
       - --url
       - http://mcp:8080
       - run
-      - --token
-      - "${CF_TUNNEL_TOKEN:?CF_TUNNEL_TOKEN must be set}"
     environment:
       TUNNEL_TRANSPORT_LOGLEVEL: info
       TUNNEL_METRICS: 127.0.0.1:2000
+      TUNNEL_TOKEN: ${CF_TUNNEL_TOKEN:?CF_TUNNEL_TOKEN must be set}
