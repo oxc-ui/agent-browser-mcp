@@ -70,12 +70,14 @@ jobs:
             < deploy/nginx.conf.template > /tmp/nginx.conf
           sudo nginx -t -c /tmp/nginx.conf
 
-      - name: Start MCP server + nginx + quick tunnel
+      - name: Start MCP server + nginx + tunnel
         env:
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
           MCP_PORT: ${{ steps.port.outputs.port }}
+          TUNNEL_PUBLIC_URL: https://agent-browser.oxu.indevs.in
         run: bash deploy/start.sh
 
       - name: Read published tunnel URL
@@ -134,12 +136,10 @@ jobs:
           # do NOT exit 1 — keep-alive must run regardless
 
       - name: Publish current endpoint to repo
-        # Best-effort publish of the live tunnel URL to a 'endpoint' branch
-        # via Contents API. Skipped silently if the workflow's GITHUB_TOKEN
-        # lacks repo write (some repos default to read-only). The tunnel
-        # itself stays up regardless; clients can discover the URL via
-        # `gh run view <id> --log | grep "current tunnel:"` for the latest
-        # run.
+        # With a named tunnel + stable hostname (agent-browser.oxu.indevs.in),
+        # the URL is fixed across runs — this step just writes a static
+        # endpoint.json for discoverability. Best-effort: skipped silently
+        # if GITHUB_TOKEN lacks repo write permission.
         continue-on-error: true
         env:
           TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
@@ -149,17 +149,16 @@ jobs:
           REPO: ${{ github.repository }}
         run: |
           set +e
-          NOW_UTC=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
 
-          # Always log the current tunnel URL prominently so it's easy to
-          # find in `gh run view --log`.
           echo "############################################################"
-          echo "# CURRENT TUNNEL ENDPOINT (run ${RUN_NUMBER}, ${NOW_UTC})"
+          echo "# CURRENT TUNNEL ENDPOINT (run ${RUN_NUMBER})"
           echo "# MCP URL:     ${TUNNEL_URL}/mcp"
           echo "# Health URL:  ${TUNNEL_URL}/healthz"
           echo "# Auth header: Authorization: Bearer \${MCP_AUTH_TOKEN}"
+          echo "# (Stable hostname — only the URL value is fixed; auth token rotates if you reset it)"
           echo "############################################################"
 
+          NOW_UTC=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
           cat > endpoint.json <<EOF
           {
             "url": "${TUNNEL_URL}",
@@ -167,24 +166,23 @@ jobs:
             "auth_header": "Authorization: Bearer \${MCP_AUTH_TOKEN}",
             "run_number": ${RUN_NUMBER},
             "updated_utc": "${NOW_UTC}",
-            "note": "Auto-published by browser-mcp workflow run #${RUN_NUMBER}."
+            "note": "Stable endpoint on agent-browser.oxu.indevs.in (Cloudflare named tunnel). URL does NOT change across runs."
           }
           EOF
           CONTENT_B64=$(base64 -w0 < endpoint.json)
 
-          # Probe whether GITHUB_TOKEN can write to this repo. If not,
-          # print a clear warning and skip silently — keep-alive still runs.
+          # Probe whether GITHUB_TOKEN can write to this repo
           PROBE=$(curl -s -o /dev/null -w '%{http_code}' \
             -H "Authorization: token ${GITHUB_TOKEN}" \
             "${API}/repos/${REPO}")
           echo "[publish] repo auth probe: HTTP ${PROBE}"
           if [ "${PROBE}" != "200" ]; then
-            echo "[publish] ::warning::GITHUB_TOKEN cannot access repo (HTTP ${PROBE}) — skipping publish, keep-alive still runs"
+            echo "[publish] ::warning::GITHUB_TOKEN cannot access repo (HTTP ${PROBE}) — skipping publish, tunnel still runs"
             cat endpoint.json
             exit 0
           fi
 
-          # Look up the file's sha on the endpoint branch (if it exists)
+          # Look up file sha + branch state
           EXISTING_FILE_SHA=""
           FILE_HTTP=$(curl -s -o /tmp/existing.json -w '%{http_code}' \
             -H "Authorization: token ${GITHUB_TOKEN}" \
@@ -201,14 +199,12 @@ jobs:
             echo "[publish] existing sha: ${EXISTING_FILE_SHA}"
           fi
 
-          # If file doesn't exist on endpoint branch, ensure branch exists first
           if [ -z "${EXISTING_FILE_SHA}" ]; then
             BRANCH_HTTP=$(curl -s -o /dev/null -w '%{http_code}' \
               -H "Authorization: token ${GITHUB_TOKEN}" \
               "${API}/repos/${REPO}/branches/endpoint")
             echo "[publish] endpoint branch exists?: HTTP ${BRANCH_HTTP}"
             if [ "${BRANCH_HTTP}" != "200" ]; then
-              echo "[publish] creating endpoint branch"
               curl -s -o /tmp/main_sha.json \
                 -H "Authorization: token ${GITHUB_TOKEN}" \
                 "${API}/repos/${REPO}/git/ref/heads/main"
@@ -229,7 +225,6 @@ jobs:
             fi
           fi
 
-          # Build PUT body
           if [ -n "${EXISTING_FILE_SHA}" ]; then
             PUT_DATA=$(python3 -c "
           import json
@@ -255,19 +250,16 @@ jobs:
             "${API}/repos/${REPO}/contents/endpoint.json" \
             -d "${PUT_DATA}")
           echo "[publish] PUT endpoint.json -> HTTP ${PUT_HTTP}"
-          if [ "${PUT_HTTP}" != "200" ] && [ "${PUT_HTTP}" != "201" ]; then
-            echo "[publish] PUT FAILED body:"
-            cat /tmp/put.json
-          fi
+          [ "${PUT_HTTP}" != "200" ] && [ "${PUT_HTTP}" != "201" ] && cat /tmp/put.json
 
-          echo "[publish] DONE — endpoint.json contents:"
+          echo "[publish] DONE"
           cat endpoint.json
 
       - name: Keep alive (supervisor, ~5h45m)
         env:
           MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
           MCP_PORT: ${{ steps.port.outputs.port }}
-          TUNNEL_URL_FILE: /tmp/abmcp-logs/tunnel_url.txt
+          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
           # 345 one-minute ticks; every tick verify the three processes,
           # restart any that died; every 5th tick probe through the tunnel
@@ -286,8 +278,8 @@ jobs:
                     ;;
                   nginx) sudo nginx -c /tmp/nginx.conf ;;
                   cloudflared)
-                    # quick-tunnel mode: no token, hostname goes to stdout
-                    nohup cloudflared tunnel --no-autoupdate --url http://localhost \
+                    nohup cloudflared tunnel --no-autoupdate run \
+                      --token "$CF_TUNNEL_TOKEN" \
                       >> /tmp/abmcp-logs/cloudflared.log 2>&1 &
                     ;;
                 esac

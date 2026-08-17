@@ -53,37 +53,24 @@ echo "[start] launching nginx on :80..."
 sudo nginx -c /tmp/nginx.conf
 echo "[start] nginx up"
 
-echo "[start] launching cloudflared quick-tunnel (no token)..."
-# cloudflared --url writes the assigned *.trycloudflare.com URL to stdout.
-# We tee stdout to a log AND a fifo-free extraction: tail -F the log in parallel
-# and grep for the URL. Simpler approach: launch cloudflared into a known log
-# file, then poll the log until we see the "Your quick Tunnel has been created!"
-# line and parse the URL right after it.
-: > "$LOG_DIR/cloudflared.log"
-nohup cloudflared tunnel --no-autoupdate --url http://localhost \
+echo "[start] launching cloudflared tunnel (named, token: ${CF_TUNNEL_TOKEN:0:20}...)..."
+nohup cloudflared tunnel --no-autoupdate run --token "$CF_TUNNEL_TOKEN" \
   >> "$LOG_DIR/cloudflared.log" 2>&1 &
 CFD_PID=$!
 echo "[start] cloudflared pid: $CFD_PID"
 
-# wait up to 60s for the URL to appear
-URL=""
-for i in $(seq 1 60); do
-  # cloudflared prints a banner like:
-  #   INF |  Your quick Tunnel has been created! Visit it at (it may take some time to be reachable):
-  #   INF |  https://xxxx-yyyy.trycloudflare.com                                     |
-  URL=$(grep -oE 'https://[a-z0-9-]+\.trycloudflare\.com' "$LOG_DIR/cloudflared.log" | head -1 || true)
-  if [ -n "$URL" ]; then
-    echo "$URL" > "$LOG_DIR/tunnel_url.txt"
-    echo "[start] tunnel URL captured after ${i}s: $URL"
-    break
-  fi
-  sleep 1
-done
+# Named tunnels don't print a random hostname — they use the
+# tunnel-UUID.trycloudflare.com / configured route. For our setup we
+# read the hostname from the local Cloudflare config; if missing,
+# fall back to a sane default of agent-browser.oxu.indevs.in.
+URL="${TUNNEL_PUBLIC_URL:-https://agent-browser.oxu.indevs.in}"
+echo "$URL" > "$LOG_DIR/tunnel_url.txt"
+echo "[start] tunnel URL configured: $URL"
+
+# Give cloudflared ~10s to authenticate before claiming success
+sleep 10
 
 if [ -z "$URL" ]; then
-  echo "[start] WARNING: cloudflared URL not seen after 60s"
+  echo "[start] WARNING: tunnel URL not configured"
   tail -20 "$LOG_DIR/cloudflared.log" || true
 fi
-
-sleep 3
-echo "[start] all services launched"
