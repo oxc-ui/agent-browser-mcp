@@ -1,0 +1,55 @@
+# agent-browser-mcp Docker stack
+# No nginx — cloudflared tunnels HTTP directly to the mcp-proxy port.
+# Auth is handled by Cloudflare Access (configured in dashboard once).
+#
+# Usage:
+#   docker compose up -d
+#   docker compose logs -f
+#
+# Environment variables (set via .env or docker run -e):
+#   CF_TUNNEL_TOKEN    Cloudflare tunnel connector token (from one.dash.cloudflare.com)
+#   OPENAI_API_KEY     Optional — only needed for browser_task agent tool
+#   OPENAI_API_BASE    Optional — LLM endpoint override (default: OpenAI)
+#   MCP_PORT           Internal port (default 8080)
+services:
+  mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    container_name: agent-browser-mcp
+    restart: unless-stopped
+    ports:
+      - "${MCP_PORT:-8080}:8080"
+    environment:
+      BROWSER_USE_HEADLESS: "true"
+      ANONYMIZED_TELEMETRY: "false"
+      BROWSER_USE_CLOUD_SYNC: "false"
+      BROWSER_USE_LOGGING_LEVEL: "info"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      OPENAI_API_BASE: "${OPENAI_API_BASE:-}"
+      MCP_PORT: "8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: agent-browser-tunnel
+    restart: unless-stopped
+    depends_on:
+      mcp:
+        condition: service_healthy
+    command:
+      - tunnel
+      - --no-autoupdate
+      - --metrics
+      - 127.0.0.1:2000
+      - run
+      - --token
+      - "${CF_TUNNEL_TOKEN:?CF_TUNNEL_TOKEN must be set}"
+    environment:
+      # Tell cloudflared to NOT do any local fallback probing
+      TUNNEL_TRANSPORT_LOGLEVEL: info
+      TUNNEL_METRICS: 127.0.0.1:2000

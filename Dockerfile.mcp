@@ -1,0 +1,76 @@
+# agent-browser-mcp — single-container MCP server.
+#
+# Layers:
+#   1. Python 3.11 + uv (matches the GitHub Actions runner image)
+#   2. system deps for Chromium (fonts, libs)
+#   3. Playwright Chromium
+#   4. browser-use[cli] + mcp-proxy (with mcp<2 pin)
+#   5. A thin supervisor that starts mcp-proxy + a /healthz sidecar
+#
+# The container exposes port 8080:
+#   - GET  /healthz          -> "ok" (for cloudflared/uptime checks)
+#   - POST /mcp              -> browser-use MCP (StreamableHTTP)
+#
+# No nginx. Auth is handled by Cloudflare Access on the tunnel route.
+
+FROM python:3.11-slim
+
+# --- System deps for Chromium + uv installation ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        curl wget ca-certificates fonts-liberation fonts-noto-color-emoji \
+        libasound2 libatk-bridge2.0-0 libatk1.0-0 libcups2 libdbus-1-3 \
+        libdrm2 libgbm1 libglib2.0-0 libnss3 libxcomposite1 libxdamage1 \
+        libxfixes3 libxkbcommon0 libxrandr2 libpango-1.0-0 libcairo2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (fast Python package manager) and Playwright Chromium
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /usr/local/bin/
+RUN uv tool install --no-cache 'mcp-proxy' --with 'mcp<2' \
+    && uv tool install --no-cache 'browser-use[cli]' \
+    && uvx --from 'playwright' playwright install chromium \
+    && uvx --from 'playwright' playwright install-deps chromium \
+    && ln -sf /root/.local/share/uv/tools/mcp-proxy/bin/mcp-proxy /usr/local/bin/mcp-proxy \
+    && ln -sf /root/.local/share/uv/tools/browser-use/bin/browser-use /usr/local/bin/browser-use
+
+# --- Pre-seed browser-use config so headless + sandbox-off are set ---
+RUN mkdir -p /root/.config/browseruse && cat > /root/.config/browseruse/config.json <<'EOF'
+{
+  "browser_profile": {
+    "id": "agent-browser-mcp",
+    "default": true,
+    "created_at": "2026-01-01T00:00:00",
+    "headless": true,
+    "chromium_sandbox": false,
+    "executable_path": "/root/.cache/ms-playwright/chromium-1234/chrome-linux/chrome"
+  },
+  "llm": {
+    "id": "agent-browser-mcp-llm",
+    "default": true,
+    "created_at": "2026-01-01T00:00:00",
+    "api_key": "",
+    "model": "gpt-4.1-mini"
+  },
+  "agent": {
+    "id": "agent-browser-mcp-agent",
+    "default": true,
+    "created_at": "2026-01-01T00:00:00"
+  }
+}
+EOF
+
+# --- Supervisor script: starts mcp-proxy + a tiny /healthz HTTP server ---
+COPY deploy/supervise.py /usr/local/bin/supervise.py
+COPY deploy/entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod +x /usr/local/bin/entrypoint.sh
+
+ENV MCP_PORT=8080 \
+    BROWSER_USE_HEADLESS=true \
+    ANONYMIZED_TELEMETRY=false \
+    BROWSER_USE_CLOUD_SYNC=false \
+    BROWSER_USE_LOGGING_LEVEL=info
+
+EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz').read()"
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

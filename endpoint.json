@@ -1,8 +1,7 @@
 {
   "url": "https://agent-browser.oxu.indevs.in",
   "mcp_endpoint": "https://agent-browser.oxu.indevs.in/mcp",
-  "auth_header": "Authorization: Bearer ${MCP_AUTH_TOKEN}",
-  "run_number": 0,
-  "updated_utc": "2026-08-17T00:10:00Z",
-  "note": "Stable endpoint on agent-browser.oxu.indevs.in (Cloudflare named tunnel). URL does NOT change across runs."
+  "auth": "Cloudflare Access — first connection opens a browser for OTP/SSO, then cached",
+  "stack": "docker-compose: mcp (browser-use + mcp-proxy + /healthz) + tunnel (cloudflared)",
+  "note": "Stable endpoint. No bearer token in headers — Cloudflare Access handles auth at the edge."
 }

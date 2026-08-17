@@ -1,0 +1,22 @@
+# Don't copy git history or large artifacts into the build context
+.git/
+.github/
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+.env
+.env.local
+*.log
+.DS_Store
+README.md
+endpoint.json
+deploy/start.sh
+deploy/nginx.conf.template
+deploy/discover-endpoint.sh
+deploy/wrap.py

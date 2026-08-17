@@ -10,9 +10,6 @@ on:
 # NOTE: no concurrency group on purpose — overlapping runs are the
 # handoff mechanism. Port rotation (below) prevents collisions.
 
-# Need write permission so the 'Publish current endpoint' step can push
-# the live URL back to this repo (default GITHUB_TOKEN is read-only on
-# the triggering branch).
 permissions:
   contents: write
 
@@ -24,101 +21,81 @@ jobs:
     timeout-minutes: 350
     steps:
       - uses: actions/checkout@v4
-        with:
-          # fetch full history so we can publish to the live README later
-          fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: astral-sh/setup-uv@v6
-        with:
-          enable-cache: true
-
-      - name: Install browser-use MCP + mcp-proxy
-        run: |
-          # mcp-proxy 0.12.x breaks against mcp>=2.0 (request_ctx removed) — pin mcp<2
-          uv tool install 'mcp-proxy' --with 'mcp<2'
-          uv tool install 'browser-use[cli]'
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          # warm the uv cache so the stdio server starts fast later
-          uvx --from 'browser-use[cli]' browser-use --version || true
-
-      - name: Install cloudflared
-        run: |
-          curl -sL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
-            -o /usr/local/bin/cloudflared
-          chmod +x /usr/local/bin/cloudflared
-          cloudflared --version
-
-      - name: Chrome /dev/shm fix
-        run: sudo mount -t tmpfs -o size=2g tmpfs /dev/shm
-
-      - name: Compute rotated port
+      - name: Compute rotated host port
         id: port
         run: |
           # run 1->8002, 2->8003, 3->8004, 4->8001, 5->8002 ...
-          # consecutive runs ALWAYS land on different ports, cycle of 4
+          # consecutive runs ALWAYS land on different host-mapped ports,
+          # so overlapping runners don't collide.
           PORT=$(( 8001 + ( ${{ github.run_number }} % 4 ) ))
           echo "port=$PORT" >> "$GITHUB_OUTPUT"
-          echo "run_number=${{ github.run_number }} -> port $PORT"
+          echo "run_number=${{ github.run_number }} -> host port $PORT"
 
-      - name: Render nginx config
-        run: |
-          mkdir -p /tmp/abmcp-logs
-          export MCP_AUTH_TOKEN="${{ secrets.MCP_AUTH_TOKEN }}"
-          export MCP_PORT="${{ steps.port.outputs.port }}"
-          envsubst '${MCP_AUTH_TOKEN} ${MCP_PORT}' \
-            < deploy/nginx.conf.template > /tmp/nginx.conf
-          sudo nginx -t -c /tmp/nginx.conf
-
-      - name: Start MCP server + nginx + tunnel
+      - name: Bring up the Docker stack
         env:
           CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
           MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
           MCP_PORT: ${{ steps.port.outputs.port }}
-          TUNNEL_PUBLIC_URL: https://agent-browser.oxu.indevs.in
-        run: bash deploy/start.sh
-
-      - name: Read published tunnel URL
-        id: tunnel
         run: |
-          # start.sh wrote /tmp/abmcp-logs/tunnel_url.txt after the tunnel came up
-          if [ ! -f /tmp/abmcp-logs/tunnel_url.txt ]; then
-            echo "::error::tunnel_url.txt missing — cloudflared never registered a hostname"
-            tail -40 /tmp/abmcp-logs/cloudflared.log || true
+          set -e
+          # Write the compose env file (avoids leaking into shell history)
+          cat > .env <<EOF
+          CF_TUNNEL_TOKEN=${CF_TUNNEL_TOKEN}
+          MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
+          OPENAI_API_KEY=${OPENAI_API_KEY}
+          OPENAI_API_BASE=${OPENAI_API_BASE}
+          MCP_PORT=${MCP_PORT}
+          EOF
+
+          # Build + start
+          docker compose build --pull
+          docker compose up -d
+
+          # Wait for the MCP container to be healthy (healthcheck in compose)
+          echo "Waiting for agent-browser-mcp to be healthy..."
+          for i in $(seq 1 60); do
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' agent-browser-mcp 2>/dev/null || echo "missing")
+            echo "  [$i] health=${STATUS}"
+            if [ "${STATUS}" = "healthy" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "${STATUS}" != "healthy" ]; then
+            echo "::error::agent-browser-mcp did not become healthy in 120s"
+            docker compose logs
             exit 1
           fi
-          URL=$(tr -d '[:space:]' < /tmp/abmcp-logs/tunnel_url.txt)
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "current tunnel: $URL"
+
+          # Capture the public host port for the health check step
+          echo "MCP_HOST_PORT=${MCP_PORT}" >> "$GITHUB_ENV"
 
       - name: Health check (local + through tunnel)
-        # Tunnel may need a few seconds to fully propagate even after
-        # cloudflared prints the URL — don't fail the run if it isn't
-        # reachable yet; the keep-alive loop will keep retrying.
-        continue-on-error: true
         env:
           MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
-          MCP_PORT: ${{ steps.port.outputs.port }}
-          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
+          TUNNEL_URL: https://agent-browser.oxu.indevs.in
         run: |
-          echo "--- local nginx /healthz ---"
-          curl -sf --max-time 10 http://127.0.0.1/healthz && echo " OK"
+          echo "--- local /healthz (host port ${MCP_HOST_PORT}) ---"
+          curl -sf --max-time 10 "http://127.0.0.1:${MCP_HOST_PORT}/healthz" && echo " OK"
 
           echo "--- local MCP initialize ---"
           code=$(curl -s -o /tmp/local_init.txt -w '%{http_code}' --max-time 60 \
-            -X POST "http://127.0.0.1:${MCP_PORT:-8001}/mcp" \
+            -X POST "http://127.0.0.1:${MCP_HOST_PORT}/mcp" \
+            -H "Authorization: Bearer ${MCP_AUTH_TOKEN}" \
             -H 'Content-Type: application/json' \
             -H 'Accept: application/json, text/event-stream' \
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}}}')
-          echo "local mcp-proxy: HTTP $code"
+          echo "local MCP: HTTP $code"
           head -c 300 /tmp/local_init.txt; echo
 
-          echo "--- through Cloudflare quick-tunnel: $TUNNEL_URL ---"
+          echo "--- through Cloudflare tunnel: ${TUNNEL_URL} ---"
           for i in $(seq 1 15); do
             code=$(curl -s -o /tmp/tunnel_init.txt -w '%{http_code}' --max-time 30 \
-              -X POST "$TUNNEL_URL/mcp" \
+              -X POST "${TUNNEL_URL}/mcp" \
               -H "Authorization: Bearer ${MCP_AUTH_TOKEN}" \
               -H 'Content-Type: application/json' \
               -H 'Accept: application/json, text/event-stream' \
@@ -131,164 +108,28 @@ jobs:
             fi
             sleep 15
           done
-          echo "::warning::Tunnel probe did not return 200 within 225s — keep-alive will keep retrying"
+          echo "::warning::tunnel probe did not return 200 within 225s — keep-alive still runs"
           tail -c 500 /tmp/tunnel_init.txt
           # do NOT exit 1 — keep-alive must run regardless
 
-      - name: Publish current endpoint to repo
-        # With a named tunnel + stable hostname (agent-browser.oxu.indevs.in),
-        # the URL is fixed across runs — this step just writes a static
-        # endpoint.json for discoverability. Best-effort: skipped silently
-        # if GITHUB_TOKEN lacks repo write permission.
-        continue-on-error: true
-        env:
-          TUNNEL_URL: ${{ steps.tunnel.outputs.url }}
-          MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
-          RUN_NUMBER: ${{ github.run_number }}
-          API: ${{ github.api_url }}
-          REPO: ${{ github.repository }}
-        run: |
-          set +e
-
-          echo "############################################################"
-          echo "# CURRENT TUNNEL ENDPOINT (run ${RUN_NUMBER})"
-          echo "# MCP URL:     ${TUNNEL_URL}/mcp"
-          echo "# Health URL:  ${TUNNEL_URL}/healthz"
-          echo "# Auth header: Authorization: Bearer \${MCP_AUTH_TOKEN}"
-          echo "# (Stable hostname — only the URL value is fixed; auth token rotates if you reset it)"
-          echo "############################################################"
-
-          NOW_UTC=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
-          cat > endpoint.json <<EOF
-          {
-            "url": "${TUNNEL_URL}",
-            "mcp_endpoint": "${TUNNEL_URL}/mcp",
-            "auth_header": "Authorization: Bearer \${MCP_AUTH_TOKEN}",
-            "run_number": ${RUN_NUMBER},
-            "updated_utc": "${NOW_UTC}",
-            "note": "Stable endpoint on agent-browser.oxu.indevs.in (Cloudflare named tunnel). URL does NOT change across runs."
-          }
-          EOF
-          CONTENT_B64=$(base64 -w0 < endpoint.json)
-
-          # Probe whether GITHUB_TOKEN can write to this repo
-          PROBE=$(curl -s -o /dev/null -w '%{http_code}' \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
-            "${API}/repos/${REPO}")
-          echo "[publish] repo auth probe: HTTP ${PROBE}"
-          if [ "${PROBE}" != "200" ]; then
-            echo "[publish] ::warning::GITHUB_TOKEN cannot access repo (HTTP ${PROBE}) — skipping publish, tunnel still runs"
-            cat endpoint.json
-            exit 0
-          fi
-
-          # Look up file sha + branch state
-          EXISTING_FILE_SHA=""
-          FILE_HTTP=$(curl -s -o /tmp/existing.json -w '%{http_code}' \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
-            "${API}/repos/${REPO}/contents/endpoint.json?ref=endpoint")
-          echo "[publish] endpoint.json on endpoint branch: HTTP ${FILE_HTTP}"
-          if [ "${FILE_HTTP}" = "200" ]; then
-            EXISTING_FILE_SHA=$(python3 -c "
-          import json
-          try:
-              print(json.load(open('/tmp/existing.json'))['sha'])
-          except Exception as e:
-              print('')
-          " 2>/dev/null)
-            echo "[publish] existing sha: ${EXISTING_FILE_SHA}"
-          fi
-
-          if [ -z "${EXISTING_FILE_SHA}" ]; then
-            BRANCH_HTTP=$(curl -s -o /dev/null -w '%{http_code}' \
-              -H "Authorization: token ${GITHUB_TOKEN}" \
-              "${API}/repos/${REPO}/branches/endpoint")
-            echo "[publish] endpoint branch exists?: HTTP ${BRANCH_HTTP}"
-            if [ "${BRANCH_HTTP}" != "200" ]; then
-              curl -s -o /tmp/main_sha.json \
-                -H "Authorization: token ${GITHUB_TOKEN}" \
-                "${API}/repos/${REPO}/git/ref/heads/main"
-              MAIN_SHA=$(python3 -c "
-          import json
-          try:
-              print(json.load(open('/tmp/main_sha.json'))['object']['sha'])
-          except Exception as e:
-              print('')
-          " 2>/dev/null)
-              if [ -n "${MAIN_SHA}" ]; then
-                curl -s -o /tmp/ref.json -w '%{http_code}\n' -X POST \
-                  -H "Authorization: token ${GITHUB_TOKEN}" \
-                  -H "Content-Type: application/json" \
-                  "${API}/repos/${REPO}/git/refs" \
-                  -d "{\"ref\":\"refs/heads/endpoint\",\"sha\":\"${MAIN_SHA}\"}"
-              fi
-            fi
-          fi
-
-          if [ -n "${EXISTING_FILE_SHA}" ]; then
-            PUT_DATA=$(python3 -c "
-          import json
-          print(json.dumps({
-            'message': 'publish endpoint (run ${RUN_NUMBER}): ${TUNNEL_URL}',
-            'branch': 'endpoint',
-            'sha': '${EXISTING_FILE_SHA}',
-            'content': '${CONTENT_B64}',
-          }))")
-          else
-            PUT_DATA=$(python3 -c "
-          import json
-          print(json.dumps({
-            'message': 'publish endpoint (run ${RUN_NUMBER}): ${TUNNEL_URL}',
-            'branch': 'endpoint',
-            'content': '${CONTENT_B64}',
-          }))")
-          fi
-
-          PUT_HTTP=$(curl -s -o /tmp/put.json -w '%{http_code}' -X PUT \
-            -H "Authorization: token ${GITHUB_TOKEN}" \
-            -H "Content-Type: application/json" \
-            "${API}/repos/${REPO}/contents/endpoint.json" \
-            -d "${PUT_DATA}")
-          echo "[publish] PUT endpoint.json -> HTTP ${PUT_HTTP}"
-          [ "${PUT_HTTP}" != "200" ] && [ "${PUT_HTTP}" != "201" ] && cat /tmp/put.json
-
-          echo "[publish] DONE"
-          cat endpoint.json
-
       - name: Keep alive (supervisor, ~5h45m)
         env:
-          MCP_AUTH_TOKEN: ${{ secrets.MCP_AUTH_TOKEN }}
-          MCP_PORT: ${{ steps.port.outputs.port }}
-          CF_TUNNEL_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
+          MCP_HOST_PORT: ${{ steps.port.outputs.port }}
         run: |
-          # 345 one-minute ticks; every tick verify the three processes,
-          # restart any that died; every 5th tick probe through the tunnel
+          # Every 60s, verify the two docker-compose services are up; if not,
+          # bring them back. Every 5th minute, probe the local /healthz.
           for i in $(seq 1 345); do
             sleep 60
 
-            for svc in mcp-proxy nginx cloudflared; do
-              if ! pgrep -f "$svc" > /dev/null; then
-                echo "[tick $i] $svc died — restarting"
-                case $svc in
-                  mcp-proxy)
-                    nohup "$HOME/.local/bin/mcp-proxy" --host 127.0.0.1 \
-                      --port "$MCP_PORT" --stateless -- \
-                      uvx --from 'browser-use[cli]' browser-use --mcp \
-                      >> /tmp/abmcp-logs/mcp-proxy.log 2>&1 &
-                    ;;
-                  nginx) sudo nginx -c /tmp/nginx.conf ;;
-                  cloudflared)
-                    nohup cloudflared tunnel --no-autoupdate run \
-                      --token "$CF_TUNNEL_TOKEN" \
-                      >> /tmp/abmcp-logs/cloudflared.log 2>&1 &
-                    ;;
-                esac
-              fi
-            done
+            # Verify both services exist (docker compose ps)
+            if ! docker compose ps --services --status running 2>/dev/null | grep -qE '^(mcp|tunnel)$'; then
+              echo "[tick $i] compose services not all running — restarting"
+              docker compose up -d
+            fi
 
             if [ $(( i % 5 )) -eq 0 ]; then
               code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 \
-                http://127.0.0.1/healthz)
+                "http://127.0.0.1:${MCP_HOST_PORT}/healthz")
               echo "[tick $i] local healthz: $code"
             fi
           done
@@ -299,5 +140,14 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: browser-mcp-logs-run-${{ github.run_number }}
-          path: /tmp/abmcp-logs/
+          path: |
+            /tmp/abmcp-logs/
+            *.log
           if-no-files-found: ignore
+
+      - name: Tear down on exit
+        if: always()
+        run: |
+          # capture logs before stopping
+          docker compose logs --no-color > "/tmp/abmcp-logs/compose-final.log" 2>&1 || true
+          docker compose down --remove-orphans || true
