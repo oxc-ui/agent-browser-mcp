@@ -34,8 +34,8 @@ def proxy_to_mcp(method: str, path: str, body: bytes, headers: dict) -> tuple[in
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
-        # Keep logs quiet; the supervisor emits its own status line per restart
-        pass
+        # One-line log per call so we can see what's happening
+        print(f"[supervise] {self.command} {self.path} -> upstream", flush=True)
 
     def do_GET(self):
         if self.path == "/healthz":
@@ -55,14 +55,20 @@ class Handler(BaseHTTPRequestHandler):
     def _proxy(self, method):
         length = int(self.headers.get("Content-Length", "0") or "0")
         body = self.rfile.read(length) if length else b""
-        # Forward only a curated set of headers — drop Host, Connection, etc.
+        # Forward ALL headers — drop only Hop-by-hop and Content-Length
+        # (we recompute it from the upstream response)
+        HOP_BY_HOP = {
+            "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+            "te", "trailers", "transfer-encoding", "upgrade", "host",
+        }
         fwd_headers = {
             k: v for k, v in self.headers.items()
-            if k.lower() in ("authorization", "content-type", "accept", "user-agent")
+            if k.lower() not in HOP_BY_HOP
         }
         try:
             status, resp_headers, resp_body = proxy_to_mcp(method, self.path, body, fwd_headers)
         except Exception as e:
+            print(f"[supervise] upstream error: {e}", flush=True)
             self.send_response(502)
             self.send_header("Content-Type", "text/plain")
             self.end_headers()
@@ -70,7 +76,7 @@ class Handler(BaseHTTPRequestHandler):
             return
         self.send_response(status)
         for k, v in resp_headers.items():
-            if k.lower() in ("content-type", "cache-control", "x-"):
+            if k.lower() not in HOP_BY_HOP and k.lower() != "content-length":
                 self.send_header(k, v)
         self.send_header("Content-Length", str(len(resp_body)))
         self.end_headers()
