@@ -43,6 +43,8 @@ jobs:
           # Don't use set -e here — we want diagnostic output even on failure
           set +e
 
+          mkdir -p /tmp/abmcp-logs
+
           # Write the compose env file
           cat > .env <<EOF
           CF_TUNNEL_TOKEN=${CF_TUNNEL_TOKEN}
@@ -71,12 +73,13 @@ jobs:
             sleep 2
           done
 
+          # Always capture initial logs for debugging, even on success
+          docker compose logs --no-color > /tmp/abmcp-logs/compose-init.log 2>&1
+
           if [ "$STATUS" != "healthy" ]; then
             echo "::error::agent-browser-mcp did not become healthy"
             echo "=== docker compose ps ==="
             docker compose ps
-            echo "=== docker compose logs (no color) ==="
-            docker compose logs --no-color 2>&1 | tail -100
             exit 1
           fi
 
@@ -99,6 +102,15 @@ jobs:
             -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"healthcheck","version":"1.0"}}}')
           echo "local MCP: HTTP $code"
           head -c 300 /tmp/local_init.txt; echo
+
+          # Network reachability: can the tunnel container reach the mcp container?
+          echo "--- network reachability ---"
+          docker compose exec -T tunnel sh -c 'wget -qO- http://mcp:8080/healthz 2>&1 || echo "wget failed"' 2>&1 | head -5
+          docker compose exec -T tunnel sh -c 'getent hosts mcp 2>&1' 2>&1 | head -5
+
+          # Capture tunnel container's view of the mcp container
+          echo "--- tunnel container logs (last 20 lines) ---"
+          docker compose logs --no-color tunnel 2>&1 | tail -20
 
           echo "--- through Cloudflare tunnel: ${TUNNEL_URL} ---"
           for i in $(seq 1 15); do
