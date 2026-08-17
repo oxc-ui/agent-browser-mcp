@@ -46,10 +46,11 @@ services:
       - --no-autoupdate
       - --metrics
       - 127.0.0.1:2000
+      - --url
+      - http://mcp:8080
       - run
       - --token
       - "${CF_TUNNEL_TOKEN:?CF_TUNNEL_TOKEN must be set}"
     environment:
-      # Tell cloudflared to NOT do any local fallback probing
       TUNNEL_TRANSPORT_LOGLEVEL: info
       TUNNEL_METRICS: 127.0.0.1:2000
