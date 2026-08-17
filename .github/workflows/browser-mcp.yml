@@ -40,8 +40,10 @@ jobs:
           OPENAI_API_BASE: ${{ secrets.OPENAI_API_BASE }}
           MCP_PORT: ${{ steps.port.outputs.port }}
         run: |
-          set -e
-          # Write the compose env file (avoids leaking into shell history)
+          # Don't use set -e here — we want diagnostic output even on failure
+          set +e
+
+          # Write the compose env file
           cat > .env <<EOF
           CF_TUNNEL_TOKEN=${CF_TUNNEL_TOKEN}
           MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
@@ -51,27 +53,33 @@ jobs:
           EOF
 
           # Build + start
-          docker compose build --pull
-          docker compose up -d
+          echo "=== docker compose build ==="
+          docker compose build --pull 2>&1 | tail -30
+          echo "=== docker compose up ==="
+          docker compose up -d 2>&1 | tail -30
 
-          # Wait for the MCP container to be healthy (healthcheck in compose)
+          # Wait for the MCP container to be healthy
           echo "Waiting for agent-browser-mcp to be healthy..."
+          STATUS=""
           for i in $(seq 1 60); do
-            STATUS=$(docker inspect --format='{{.State.Health.Status}}' agent-browser-mcp 2>/dev/null || echo "missing")
+            STATUS=$(docker inspect --format='{{.State.Health.Status}}' agent-browser-mcp 2>/dev/null)
+            [ -z "$STATUS" ] && STATUS="(no container yet)"
             echo "  [$i] health=${STATUS}"
-            if [ "${STATUS}" = "healthy" ]; then
+            if [ "$STATUS" = "healthy" ]; then
               break
             fi
             sleep 2
           done
 
-          if [ "${STATUS}" != "healthy" ]; then
-            echo "::error::agent-browser-mcp did not become healthy in 120s"
-            docker compose logs
+          if [ "$STATUS" != "healthy" ]; then
+            echo "::error::agent-browser-mcp did not become healthy"
+            echo "=== docker compose ps ==="
+            docker compose ps
+            echo "=== docker compose logs (no color) ==="
+            docker compose logs --no-color 2>&1 | tail -100
             exit 1
           fi
 
-          # Capture the public host port for the health check step
           echo "MCP_HOST_PORT=${MCP_PORT}" >> "$GITHUB_ENV"
 
       - name: Health check (local + through tunnel)
