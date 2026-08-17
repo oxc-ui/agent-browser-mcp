@@ -29,8 +29,8 @@ RUN uv tool install --no-cache 'mcp-proxy' --with 'mcp<2' \
     && uv tool install --no-cache 'browser-use[cli]' \
     && uvx --from 'playwright' playwright install chromium \
     && uvx --from 'playwright' playwright install-deps chromium \
-    && ln -sf /root/.local/share/uv/tools/mcp-proxy/bin/mcp-proxy /usr/local/bin/mcp-proxy \
-    && ln -sf /root/.local/share/uv/tools/browser-use/bin/browser-use /usr/local/bin/browser-use
+    && ln -sf /root/.local/bin/mcp-proxy /usr/local/bin/mcp-proxy \
+    && ln -sf /root/.local/bin/browser-use /usr/local/bin/browser-use
 
 # --- Pre-seed browser-use config so headless + sandbox-off are set ---
 RUN mkdir -p /root/.config/browseruse && cat > /root/.config/browseruse/config.json <<'EOF'
