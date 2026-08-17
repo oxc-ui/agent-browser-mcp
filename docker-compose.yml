@@ -32,6 +32,8 @@ services:
       BROWSER_USE_LOGGING_LEVEL: "info"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
       OPENAI_API_BASE: "${OPENAI_API_BASE:-}"
+      # Custom provider (PXO/indevs proxy) requires this exact model:
+      BROWSER_USE_MODEL: "openrouter/openrouter/free"
       MCP_PORT: "8080"
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz').read()"]

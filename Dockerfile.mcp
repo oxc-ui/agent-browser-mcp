@@ -32,31 +32,9 @@ RUN uv tool install --no-cache 'mcp-proxy' --with 'mcp<2' \
     && ln -sf /root/.local/bin/mcp-proxy /usr/local/bin/mcp-proxy \
     && ln -sf /root/.local/bin/browser-use /usr/local/bin/browser-use
 
-# --- Pre-seed browser-use config so headless + sandbox-off are set ---
-RUN mkdir -p /root/.config/browseruse && cat > /root/.config/browseruse/config.json <<'EOF'
-{
-  "browser_profile": {
-    "id": "agent-browser-mcp",
-    "default": true,
-    "created_at": "2026-01-01T00:00:00",
-    "headless": true,
-    "chromium_sandbox": false,
-    "executable_path": "/root/.cache/ms-playwright/chromium-1234/chrome-linux/chrome"
-  },
-  "llm": {
-    "id": "agent-browser-mcp-llm",
-    "default": true,
-    "created_at": "2026-01-01T00:00:00",
-    "api_key": "",
-    "model": "gpt-4.1-mini"
-  },
-  "agent": {
-    "id": "agent-browser-mcp-agent",
-    "default": true,
-    "created_at": "2026-01-01T00:00:00"
-  }
-}
-EOF
+# --- browser-use config is generated at container startup by
+# entrypoint.sh (UUID-keyed schema + model from BROWSER_USE_MODEL env).
+# Nothing to pre-seed here. ---
 
 # --- Supervisor script: starts mcp-proxy + a tiny /healthz HTTP server ---
 COPY deploy/supervise.py /usr/local/bin/supervise.py
@@ -67,7 +45,8 @@ ENV MCP_PORT=8080 \
     BROWSER_USE_HEADLESS=true \
     ANONYMIZED_TELEMETRY=false \
     BROWSER_USE_CLOUD_SYNC=false \
-    BROWSER_USE_LOGGING_LEVEL=info
+    BROWSER_USE_LOGGING_LEVEL=info \
+    BROWSER_USE_MODEL=openrouter/openrouter/free
 
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
